@@ -545,7 +545,7 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
         if (index < 0) next.segments.push(connectionDraft);
         else next.segments[index] = connectionDraft;
         change(next);
-        setSelectedSegment(connectionDraft.id);
+        setSelectedSegment(null);
         setConnectionDraft(null);
         setSelection(null);
     }
