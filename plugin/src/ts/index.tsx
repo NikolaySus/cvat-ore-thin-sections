@@ -3,7 +3,7 @@ import { createRoot, Root } from '@modules/react-dom/client';
 import {
     CloseOutlined, PlayCircleOutlined, EyeOutlined, EditOutlined, LinkOutlined,
     UndoOutlined, DownloadOutlined, UploadOutlined, ZoomInOutlined, ZoomOutOutlined,
-    AimOutlined, DeleteOutlined, StopOutlined, DragOutlined,
+    AimOutlined, DeleteOutlined, StopOutlined, DragOutlined, ClearOutlined, CheckOutlined,
 } from '@modules/@ant-design/icons';
 import { createAnnotationsAsync, fetchAnnotationsAsync } from 'actions/annotation-actions';
 import { ObjectType, ShapeType, Source } from 'cvat-core-wrapper';
@@ -70,10 +70,12 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
     const frame = store.getState().annotation.player.frame.number;
     const base = `/frames/${job.id}/${frame}`;
     const [record, setRecord] = useState<any>(null);
+    const recordRef = useRef<any>(null);
+    recordRef.current = record;
     const [settings, setSettings] = useState<any>(null);
     const [geometry, setGeometry] = useState<any>(null);
-    const pendingStrokes = settings?.strokes.slice(geometry?.processedStrokeCount || 0) || [];
-    const geometryPending = Boolean(geometry && pendingStrokes.length);
+    const pendingStrokes = settings?.strokes.filter((stroke: any) => !geometry?.processedStrokeIds?.includes(stroke.id)) || [];
+    const geometryPending = Boolean(settings && (!geometry || geometry.sourceKey !== geometryKey(settings)));
     const [result, setResult] = useState<any>(null);
     const [work, setWork] = useState<any>(null);
     const [error, setError] = useState('');
@@ -82,8 +84,16 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
     const [mode, setMode] = useState('pan');
     const [opacity, setOpacity] = useState(.55);
     const [showSketch, setShowSketch] = useState(false);
+    const [autoGeometry, setAutoGeometry] = useState(true);
+    const [geometryRefreshing, setGeometryRefreshing] = useState(false);
+    const [pointerActive, setPointerActive] = useState(false);
+    const [hoverContour, setHoverContour] = useState<string | null>(null);
     const [selection, setSelection] = useState<any>(null);
     const [selectedSegment, setSelectedSegment] = useState<string | null>(null);
+    const [connectionDraft, setConnectionDraft] = useState<any>(null);
+    const connectionDraftRef = useRef<any>(null);
+    connectionDraftRef.current = connectionDraft;
+    const [canvasSize, setCanvasSize] = useState([1, 1]);
     const [box, setBox] = useState<number[]>([0, 0, 1, 1]);
     const [mapping, setMapping] = useState<Record<string, number>>({});
     const [busy, setBusy] = useState(false);
@@ -94,6 +104,11 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
     const drag = useRef<any>(null);
     const history = useRef<any[]>([]);
     const activeWork = useRef<string | null>(null);
+    const previewSession = useRef(crypto.randomUUID());
+    const previewGeneration = useRef(0);
+    const previewIds = useRef(new Set<string>());
+    const previewFlight = useRef<any>(null);
+    const saveFlight = useRef<Promise<any> | null>(null);
     const mounted = useRef(true);
     const upload = useRef<HTMLInputElement>(null);
     const importSettings = useRef<HTMLInputElement>(null);
@@ -121,8 +136,69 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
             mounted.current = false;
             unsubscribe();
             if (activeWork.current) request(`/jobs/${activeWork.current}`, { method: 'DELETE' }).catch(() => {});
+            for (const id of previewIds.current) request(`/previews/${id}`, { method: 'DELETE' }).catch(() => {});
         };
     }, []);
+
+    const requestedGeometryKey = settings && geometryKey(settings);
+    useEffect(() => {
+        if (!settings || !svgRef.current) return undefined;
+        const observer = new ResizeObserver(([entry]) => setCanvasSize([entry.contentRect.width, entry.contentRect.height]));
+        observer.observe(svgRef.current);
+        return () => observer.disconnect();
+    }, [Boolean(settings)]);
+    useEffect(() => {
+        if (!settings || !autoGeometry || busy || pointerActive) return undefined;
+        const timer = setTimeout(() => { refreshGeometry(); }, 700);
+        return () => clearTimeout(timer);
+    }, [requestedGeometryKey, autoGeometry, busy, pointerActive]);
+
+    async function refreshGeometry(): Promise<boolean> {
+        while (saveFlight.current) await saveFlight.current;
+        const state = structuredClone(currentSettings.current);
+        const key = geometryKey(state);
+        if (geometry?.sourceKey === key) return true;
+        if (previewFlight.current?.key === key) return previewFlight.current.promise;
+        const generation = ++previewGeneration.current;
+        const currentRecord = recordRef.current;
+        setGeometryRefreshing(true);
+        const promise = (async () => {
+            let id: string | null = null;
+            try {
+                let status = await request(`${base}/preview`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ revision: currentRecord.revision, session: previewSession.current, generation, state }) });
+                id = status.id;
+                if (!mounted.current) { await request(`/previews/${id}`, { method: 'DELETE' }); return false; }
+                previewIds.current.add(id);
+                while (mounted.current && ['queued', 'running'].includes(status.status)) {
+                    await new Promise((resolve) => setTimeout(resolve, 300));
+                    if (!mounted.current) return false;
+                    status = await request(`/previews/${id}`);
+                }
+                while (mounted.current && drag.current) await new Promise((resolve) => setTimeout(resolve, 100));
+                if (!mounted.current || generation !== previewGeneration.current || key !== geometryKey(currentSettings.current)) return false;
+                if (status.status === 'failed') throw new Error(status.error);
+                if (status.status !== 'completed' || status.importDigest !== (recordRef.current.importDigest || '')) return false;
+                setGeometry({ ...status.result, sourceKey: key });
+                setSelection((previous: any) => status.result.endpoints.find((end: any) => end.id === previous?.id) || null);
+                setSelectedSegment((previous: any) => status.result.segments.some((segment: any) => segment.id === previous) ? previous : null);
+                setHoverContour(null);
+                setError('');
+                return true;
+            } catch (exc) {
+                if (mounted.current && generation === previewGeneration.current && key === geometryKey(currentSettings.current)) setError(exc.message);
+                return false;
+            } finally {
+                if (id) previewIds.current.delete(id);
+                if (generation === previewGeneration.current) {
+                    previewFlight.current = null;
+                    if (mounted.current) setGeometryRefreshing(false);
+                }
+            }
+        })();
+        previewFlight.current = { key, promise };
+        return promise;
+    }
 
     function change(next: any): void {
         history.current.push(structuredClone(settings));
@@ -133,10 +209,21 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
     }
 
     async function save(): Promise<any> {
-        const data = await request(base, { method: 'PUT', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ revision: record.revision, state: currentSettings.current }) });
-        setRecord({ ...record, ...data });
-        return data;
+        while (saveFlight.current) await saveFlight.current;
+        const current = recordRef.current;
+        const snapshot = structuredClone(currentSettings.current);
+        if (JSON.stringify(snapshot) === JSON.stringify(current.state)) return current;
+        const promise = request(base, { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ revision: current.revision, state: snapshot }) });
+        saveFlight.current = promise;
+        try {
+            const data = await promise;
+            recordRef.current = { ...recordRef.current, ...data };
+            if (mounted.current) setRecord(recordRef.current);
+            return data;
+        } finally {
+            if (saveFlight.current === promise) saveFlight.current = null;
+        }
     }
 
     async function closeSaved(): Promise<void> {
@@ -148,13 +235,12 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
     }
 
     async function calculate(kind: string): Promise<boolean> {
-        if (kind === 'segmentation' && showSketch && (!geometry || geometry.sourceKey !== geometryKey(settings))) {
-            if (!await calculate('geometry')) return false;
-        }
+        if (kind === 'geometry') return refreshGeometry();
         setBusy(true);
         setError('');
         setNotice('');
         try {
+            if ((showSketch || settings.corrected) && !await refreshGeometry()) return false;
             const saved = await save();
             const started = await request(`${base}/jobs?revision=${saved.revision}&kind=${kind}`, { method: 'POST' });
             activeWork.current = started.id;
@@ -171,17 +257,10 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
             if (status.status === 'failed') throw new Error(status.error);
             if (status.status === 'completed') {
                 const data = await request(`/jobs/${started.id}/result`);
-                if (kind === 'geometry') {
-                    setGeometry({ ...data.result, processedStrokeCount: saved.state.strokes.length,
-                        sourceKey: geometryKey(saved.state) });
-                    setSelectedSegment(null);
-                    setSelection(null);
-                } else {
-                    setResult({ ...data, id: started.id });
-                    setView('result');
-                    setMode('pan');
-                    if (settings.corrected && !data.result.correction_applied) setNotice('Замкнутая область не найдена. Коррекция по эскизу не применена.');
-                }
+                setResult({ ...data, id: started.id });
+                setView('result');
+                setMode('pan');
+                if (settings.corrected && !data.result.correction_applied) setNotice('Замкнутая область не найдена. Коррекция по эскизу не применена.');
                 return true;
             }
         } catch (exc) { if (mounted.current) setError(exc.message); }
@@ -190,12 +269,13 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
     }
 
     function geometryKey(state: any): string {
-        return JSON.stringify([state.sketch, state.strokes, state.segments, state.regionMode]);
+        return JSON.stringify([state.sketch, state.strokes, state.segments, state.regionMode,
+            state.deletedImportedComponents, recordRef.current?.importDigest || '']);
     }
 
     async function toggleSketch(checked: boolean): Promise<void> {
         if (!checked) { setShowSketch(false); return; }
-        if ((!geometry || geometry.sourceKey !== geometryKey(settings)) && !await calculate('geometry')) return;
+        if (!await refreshGeometry()) return;
         setShowSketch(true);
     }
 
@@ -216,7 +296,7 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
         } else if (!drag.current && mode === 'pan') {
             drag.current = { type: 'pan', start: p, box: [...box] };
         }
-        if (drag.current) svgRef.current.setPointerCapture(event.pointerId);
+        if (drag.current) { setPointerActive(true); svgRef.current.setPointerCapture(event.pointerId); }
     }
 
     function pointerMove(event: React.PointerEvent): void {
@@ -229,12 +309,12 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
         } else if (active.type === 'pan') {
             setBox([box[0] + active.start[0] - p[0], box[1] + active.start[1] - p[1], box[2], box[3]]);
         } else {
-            const next = structuredClone(currentSettings.current);
-            const segment = next.segments.find((item: any) => item.id === active.id);
+            const segment = structuredClone(connectionDraftRef.current);
+            if (!segment || segment.id !== active.id) return;
             if (active.type === 'control') segment.control = p;
             else segment.tangent = [p[0] - segment.control[0], p[1] - segment.control[1]];
-            setSettings(next);
-            setResult(null);
+            segment.uiRoute = 'curve';
+            setConnectionDraft(segment);
         }
     }
 
@@ -242,15 +322,16 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
         const active = drag.current;
         drag.current = null;
         if (active?.type === 'stroke' && active.points.length > 1) {
-            change({ ...settings, strokes: [...settings.strokes, active.points] });
+            change({ ...settings, strokes: [...settings.strokes, { id: crypto.randomUUID(), points: active.points }] });
             setSelection(null);
             setSelectedSegment(null);
         }
         setDraft([]);
+        setPointerActive(false);
     }
 
     function connectEndpoint(endpoint: any): void {
-        if (busy || geometryPending) return;
+        if (busy || geometryPending || connectionDraft) return;
         if (!selection) { setSelection(endpoint); return; }
         if (selection.id === endpoint.id) { setSelection(null); return; }
         const a: Point = [selection.x, selection.y];
@@ -261,7 +342,7 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
             a, b, routeType: 'curve', control: candidate?.curveDefaultControl || [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2],
             tangent: [b[0] - a[0], b[1] - a[1]], perimeterPoints: candidate?.perimeterRoute?.points || [],
             defaultControl: candidate?.curveDefaultControl, uiRoute: 'curve' };
-        change({ ...settings, segments: [...settings.segments, segment] });
+        setConnectionDraft(segment);
         setSelectedSegment(segment.id);
         setSelection(null);
     }
@@ -269,9 +350,35 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
     function handleDrag(event: React.PointerEvent, type: string, id: string): void {
         event.stopPropagation();
         if (busy) return;
-        history.current.push(structuredClone(settings));
+        if (!connectionDraftRef.current) {
+            const original = currentSettings.current.segments.find((item: any) => item.id === id);
+            if (!original) return;
+            connectionDraftRef.current = structuredClone(original);
+            setConnectionDraft(connectionDraftRef.current);
+        }
         drag.current = { type, id };
+        setPointerActive(true);
         svgRef.current.setPointerCapture(event.pointerId);
+    }
+
+    function eraseContour(id: string): void {
+        if (busy || geometryPending || mode !== 'erase' || view !== 'sketch') return;
+        const contour = geometry.contours.find((item: any) => item.id === id);
+        if (!contour) return;
+        const refs = new Set<string>(contour.sourceRefs);
+        const endpoints = new Set(geometry.allEndpoints.filter((end: any) => contour.lineIds.includes(end.componentId)).map((end: any) => end.id));
+        change({ ...settings,
+            strokes: settings.strokes.filter((stroke: any) => !refs.has(`stroke-${stroke.id}`)),
+            deletedImportedComponents: [...new Set([...settings.deletedImportedComponents,
+                ...contour.sourceRefs.filter((ref: string) => ref.startsWith('import-'))])],
+            segments: settings.segments.filter((segment: any) => !contour.segmentIds.includes(segment.id) &&
+                !endpoints.has(segment.aEndpointId) && !endpoints.has(segment.bEndpointId)),
+        });
+        setGeometry({ ...geometry, lines: geometry.lines.filter((line: any) => line.contourId !== id),
+            segments: geometry.segments.filter((segment: any) => segment.contourId !== id),
+            contours: geometry.contours.filter((item: any) => item.id !== id) });
+        setSelectedSegment(null); setSelection(null); setHoverContour(null);
+        setConnectionDraft(null);
     }
 
     function zoom(factor: number): void {
@@ -332,6 +439,7 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
             setSettings(data.state);
             setGeometry(null);
             setResult(null);
+            setConnectionDraft(null);
             setNotice('Эскиз загружен.');
         } catch (exc) { setError(exc.message); }
         finally { setBusy(false); }
@@ -348,7 +456,7 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
         painter.strokeStyle = '#0037ff';
         painter.lineWidth = Math.max(3, record.width / 300);
         for (const line of geometry?.lines || []) for (const path of line.paths) painter.stroke(new Path2D(path));
-        for (const segment of settings.segments) painter.stroke(new Path2D(segmentPath(segment)));
+        for (const segment of settings.segments.filter((item: any) => geometry.segments.some((s: any) => s.id === item.id))) painter.stroke(new Path2D(segmentPath(segment)));
         canvas.toBlob((blob) => {
             const url = URL.createObjectURL(blob);
             const anchor = document.createElement('a');
@@ -359,10 +467,35 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
         });
     }
 
-    const selected = settings?.segments.find((segment: any) => segment.id === selectedSegment);
-    function setRoute(route: string): void {
+    const selected = connectionDraft || settings?.segments.find((segment: any) => segment.id === selectedSegment);
+    const screenUnit = 1 / Math.max(.0001, Math.min(canvasSize[0] / box[2], canvasSize[1] / box[3]));
+    const draftEndpointsValid = connectionDraft && [connectionDraft.aEndpointId, connectionDraft.bEndpointId]
+        .every((id: string) => geometry?.allEndpoints.some((endpoint: any) => endpoint.id === id));
+    function cancelConnection(): void {
+        const original = settings.segments.find((item: any) => item.id === connectionDraft?.id);
+        setSelectedSegment(original?.id || null);
+        setConnectionDraft(null);
+        setSelection(null);
+    }
+    function editConnection(segment: any): void {
+        if (busy || connectionDraft) return;
+        setSelectedSegment(segment.id);
+        setConnectionDraft(structuredClone(segment));
+        setSelection(null);
+    }
+    function confirmConnection(): void {
+        if (!connectionDraft || busy || geometryPending || !draftEndpointsValid) return;
         const next = structuredClone(settings);
-        const segment = next.segments.find((item: any) => item.id === selectedSegment);
+        const index = next.segments.findIndex((item: any) => item.id === connectionDraft.id);
+        if (index < 0) next.segments.push(connectionDraft);
+        else next.segments[index] = connectionDraft;
+        change(next);
+        setSelectedSegment(connectionDraft.id);
+        setConnectionDraft(null);
+        setSelection(null);
+    }
+    function setRoute(route: string): void {
+        const segment = structuredClone(selected);
         segment.uiRoute = route;
         segment.tangent = [segment.b[0] - segment.a[0], segment.b[1] - segment.a[1]];
         if (route === 'straight') segment.control = [(segment.a[0] + segment.b[0]) / 2, (segment.a[1] + segment.b[1]) / 2];
@@ -373,7 +506,7 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
             segment.control = edge || [0, record.height / 2];
             segment.tangent = [record.width * 4, record.height * 4];
         }
-        change(next);
+        setConnectionDraft(segment);
     }
     function segmentPath(segment: any): string {
         const normalized = geometry?.segments.find((item: any) => item.id === segment.id &&
@@ -415,8 +548,8 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
                                     if (!window.confirm('Очистить экспертный эскиз этого кадра?')) return;
                                     try {
                                         const saved = await request(`${base}/sketch?revision=${record.revision}`, { method: 'DELETE' });
-                                        setRecord({ ...record, ...saved, hasSketch: false });
-                                        setSettings(saved.state); setGeometry(null); setResult(null); setSelectedSegment(null);
+                                    setRecord({ ...record, ...saved, hasSketch: false, importDigest: '' });
+                                        setSettings(saved.state); setGeometry(null); setResult(null); setSelectedSegment(null); setConnectionDraft(null);
                                     } catch (exc) { setError(exc.message); }
                                 }}><DeleteOutlined /></button></div>
                         </details>
@@ -426,7 +559,11 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
                             onChange={(e) => change({ ...settings, regionMode: e.target.value })}>
                             <option value='inside'>Внутри контура</option><option value='outside'>Снаружи контура</option></select></label>
                         <details><summary>Настройки коррекции</summary>{Object.keys(settings.correction).map((key) => field('correction', key))}</details>
-                        <div className='ore-actions'><button disabled={busy} onClick={() => calculate('geometry')}><LinkOutlined /> Обновить контуры</button></div>
+                        <label className='ore-check'><input type='checkbox' checked={autoGeometry} disabled={busy}
+                            onChange={(event) => setAutoGeometry(event.target.checked)} /> Автообновление контуров</label>
+                        {!autoGeometry && <div className='ore-actions'><button disabled={busy || geometryRefreshing}
+                            onClick={() => calculate('geometry')}><LinkOutlined /> Обновить контуры</button></div>}
+                        {geometryRefreshing && <div className='ore-geometry-status' role='status'>Обновление контуров…</div>}
                         <button className='ore-primary' disabled={busy} onClick={() => calculate('segmentation')}><PlayCircleOutlined /> Рассчитать маски</button>
                         {busy && <div className='ore-progress' role='status'>{work?.status === 'queued' ? `Очередь: ${work.position}` : 'Расчёт…'} {work?.elapsed || 0} с
                             <button title='Отменить расчёт' onClick={() => activeWork.current && request(`/jobs/${activeWork.current}`, { method: 'DELETE' }).catch((exc) => setError(exc.message))}><StopOutlined /></button></div>}
@@ -444,13 +581,16 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
                             <div className='ore-tools'>
                                 <button title='Перемещение' className={mode === 'pan' ? 'active' : ''} onClick={() => setMode('pan')}><DragOutlined /></button>
                                 <button title='Рисовать контур' className={mode === 'draw' ? 'active' : ''} onClick={() => setMode('draw')}><EditOutlined /></button>
+                                <button title={geometryPending ? 'Контуры ещё не обновлены' : 'Удалить контур'} disabled={busy || geometryPending}
+                                    className={mode === 'erase' ? 'active' : ''} onClick={() => setMode('erase')}><ClearOutlined /></button>
                                 <button title={geometryPending ? 'Сначала обновите контуры' : 'Соединять концы'} disabled={geometryPending}
                                     className={mode === 'connect' ? 'active' : ''} onClick={() => setMode('connect')}><LinkOutlined /></button>
                                 <button title='Отменить правку эскиза' disabled={busy || !history.current.length} onClick={() => {
-                                    setSettings(history.current.pop()); setGeometry(null); setResult(null); setSelectedSegment(null);
+                                    setSettings(history.current.pop()); setGeometry(null); setResult(null); setSelectedSegment(null); setSelection(null); setConnectionDraft(null);
                                 }}><UndoOutlined /></button>
                                 <button title='Удалить выбранное соединение' disabled={!selected || busy} onClick={() => {
-                                    change({ ...settings, segments: settings.segments.filter((item: any) => item.id !== selected.id) }); setSelectedSegment(null);
+                                    if (settings.segments.some((item: any) => item.id === selected.id)) change({ ...settings, segments: settings.segments.filter((item: any) => item.id !== selected.id) });
+                                    setSelectedSegment(null); setConnectionDraft(null);
                                 }}><DeleteOutlined /></button>
                                 <button title='Увеличить' onClick={() => zoom(.8)}><ZoomInOutlined /></button>
                                 <button title='Уменьшить' onClick={() => zoom(1.25)}><ZoomOutOutlined /></button>
@@ -472,15 +612,33 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
                                 {view === 'result' && result && <image href={`${API}/jobs/${result.id}/mask.png`} width={record.width} height={record.height} opacity={opacity} />}
                                 {(view === 'sketch' || (view === 'result' && showSketch)) && <g fill='none'
                                     pointerEvents={view === 'result' ? 'none' : undefined} strokeWidth={Math.max(3, box[2] / 450)}>
-                                    {view === 'sketch' && !geometry && record.hasSketch && <image href={`${API}${base}/sketch?revision=${record.revision}`}
+                                    {view === 'sketch' && !geometry && record.hasSketch && !settings.deletedImportedComponents.length && <image href={`${API}${base}/sketch?revision=${record.revision}`}
                                         width={record.width} height={record.height} style={{ mixBlendMode: 'multiply' }} pointerEvents='none' />}
                                     {(view === 'sketch' && !geometryPending ? geometry?.regionChoices || [] : []).filter((choice: any) => choice.id === settings.regionMode).map((choice: any) =>
                                         <path key={choice.id} d={choice.path} fill='#00dd8025' fillRule='evenodd' stroke='none' pointerEvents='none' />)}
                                     {(geometry?.lines || []).map((line: any) => line.paths.map((path: string, index: number) =>
-                                        <path key={`${line.id}-${index}`} d={path} stroke={line.closed ? '#ff4040' : '#246aff'} />))}
-                                    {view === 'sketch' && pendingStrokes.map((stroke: Point[], index: number) => <polyline key={`stroke-${index}`} points={stroke.map((p) => p.join(',')).join(' ')} stroke='#246aff' />)}
-                                    {settings.segments.map((segment: any) => <path key={segment.id} d={segmentPath(segment)} stroke={view === 'sketch' && segment.id === selectedSegment ? '#00dd80' : geometry?.segments.find((s: any) => s.id === segment.id)?.mainColor === 'red' ? '#ff4040' : '#246aff'}
-                                        onPointerDown={(event) => { event.stopPropagation(); setSelectedSegment(segment.id); }} style={{ cursor: 'pointer' }} />)}
+                                        <g key={`${line.id}-${index}`}>
+                                            <path d={path} stroke={view === 'sketch' && mode === 'erase' && hoverContour === line.contourId ? '#ec9700' : line.closed ? '#ff4040' : '#246aff'} />
+                                            {view === 'sketch' && mode === 'erase' && !geometryPending && <path d={path} stroke='transparent'
+                                                strokeWidth={Math.max(3, box[2] / 450) + box[2] / 90} pointerEvents='stroke' style={{ cursor: 'pointer' }}
+                                                onPointerEnter={() => setHoverContour(line.contourId)} onPointerLeave={() => setHoverContour(null)}
+                                                onPointerDown={(event) => { event.stopPropagation(); eraseContour(line.contourId); }} />}
+                                        </g>))}
+                                    {view === 'sketch' && pendingStrokes.map((stroke: any) => <polyline key={stroke.id} points={stroke.points.map((p: Point) => p.join(',')).join(' ')} stroke='#246aff' />)}
+                                    {settings.segments.filter((segment: any) => geometryPending || geometry?.segments.some((s: any) => s.id === segment.id)).map((segment: any) => {
+                                        const contourId = geometry?.segments.find((s: any) => s.id === segment.id)?.contourId;
+                                        return <g key={segment.id}>
+                                            <path d={segmentPath(segment)} stroke={view === 'sketch' && mode === 'erase' && hoverContour === contourId ? '#ec9700' : view === 'sketch' && segment.id === selectedSegment && !connectionDraft ? '#00dd80' : geometry?.segments.find((s: any) => s.id === segment.id)?.mainColor === 'red' ? '#ff4040' : '#246aff'}
+                                                onPointerDown={(event) => { if (mode === 'erase') return; event.stopPropagation(); editConnection(segment); }} style={{ cursor: 'pointer' }} />
+                                            {view === 'sketch' && mode === 'erase' && !geometryPending && <path d={segmentPath(segment)} stroke='transparent'
+                                                strokeWidth={Math.max(3, box[2] / 450) + box[2] / 90} pointerEvents='stroke' style={{ cursor: 'pointer' }}
+                                                onPointerEnter={() => setHoverContour(contourId)} onPointerLeave={() => setHoverContour(null)}
+                                                onPointerDown={(event) => { event.stopPropagation(); eraseContour(contourId); }} />}
+                                        </g>;
+                                    })}
+                                    {view === 'sketch' && connectionDraft && <path className='ore-connection-draft'
+                                        d={segmentPath(connectionDraft)} stroke='#ec9700' strokeDasharray={`${6 * screenUnit} ${4 * screenUnit}`}
+                                        pointerEvents='none' />}
                                     {view === 'sketch' && <polyline points={draft.map((p) => p.join(',')).join(' ')} stroke='#246aff' />}
                                     {view === 'sketch' && mode === 'connect' && !geometryPending && (geometry?.endpoints || []).filter((endpoint: any) => !settings.segments.some((s: any) => s.aEndpointId === endpoint.id || s.bEndpointId === endpoint.id))
                                         .map((endpoint: any) => <circle key={endpoint.id} role='button' aria-label={`Конец контура ${endpoint.id}`} cx={endpoint.x} cy={endpoint.y} r={box[2] / 110}
@@ -491,7 +649,17 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
                                         <circle cx={selected.control[0]} cy={selected.control[1]} r={box[2] / 100} fill='#fff' style={{ cursor: 'move' }}
                                             onPointerDown={(event) => handleDrag(event, 'control', selected.id)} />
                                         <circle cx={selected.control[0] + selected.tangent[0]} cy={selected.control[1] + selected.tangent[1]} r={box[2] / 120} fill='#00dd80' style={{ cursor: 'move' }}
-                                            onPointerDown={(event) => handleDrag(event, 'tangent', selected.id)} /></g>}
+                                            onPointerDown={(event) => handleDrag(event, 'tangent', selected.id)} />
+                                        {connectionDraft && <foreignObject width='72' height='34' stroke='none'
+                                            transform={`translate(${Math.max(box[0], Math.min(selected.control[0] + 18 * screenUnit, box[0] + box[2] - 72 * screenUnit))} ${Math.max(box[1], Math.min(selected.control[1] - 17 * screenUnit, box[1] + box[3] - 34 * screenUnit))}) scale(${screenUnit})`}>
+                                            <div className='ore-connection-actions' onPointerDown={(event) => event.stopPropagation()}>
+                                                <button title='Подтвердить соединение' aria-label='Подтвердить соединение'
+                                                    disabled={busy || geometryPending || !draftEndpointsValid} onClick={confirmConnection}><CheckOutlined /></button>
+                                                <button title='Отменить соединение' aria-label='Отменить соединение' disabled={busy}
+                                                    onClick={cancelConnection}><CloseOutlined /></button>
+                                            </div>
+                                        </foreignObject>}
+                                    </g>}
                                 </g>}
                             </svg>
                         </div>
@@ -512,6 +680,7 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
                     setRecord({ ...record, ...saved });
                     change(saved.state);
                     setGeometry(null);
+                    setConnectionDraft(null);
                 } catch (exc) { setError(exc.message || 'Некорректный JSON настроек.'); }
             }} />
         </div>

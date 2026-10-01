@@ -18,9 +18,10 @@ def connect():
 
 def load(job, frame):
     from .engine import defaults
+    from .sketch import normalize_state
     with closing(connect()) as conn, conn:
         row = conn.execute("SELECT revision, state FROM frames WHERE job=? AND frame=?", (job, frame)).fetchone()
-    return {"revision": row["revision"], "state": json.loads(row["state"])} if row else {"revision": 0, "state": defaults()}
+    return {"revision": row["revision"], "state": normalize_state(json.loads(row["state"]))} if row else {"revision": 0, "state": defaults()}
 
 
 def save(job, frame, state, expected):

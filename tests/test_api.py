@@ -63,3 +63,20 @@ def test_imported_sketch_preview_requires_access(client):
     assert response.headers["cache-control"] == "no-store"
     assert client.delete(path + "?revision=1", headers=headers).status_code == 200
     assert client.get(path, headers=headers).status_code == 404
+
+
+def test_legacy_state_and_preview_does_not_save(client, monkeypatch):
+    headers = {"Authorization": "Token test"}
+    path = "/ore/api/frames/1/0"
+    state = defaults()
+    state.pop("deletedImportedComponents")
+    state["strokes"] = [[[10,20],[130,20]]]
+    saved = client.put(path, headers=headers, json={"revision":0,"state":state}).json()
+    assert "id" in saved["state"]["strokes"][0]
+    monkeypatch.setattr(api.preview_queue, "submit", lambda *args: {"id":"test", "status":"queued"})
+    payload = {"revision":1, "session":"panel", "generation":1, "state":saved["state"]}
+    assert client.post(path+"/preview", json=payload).status_code == 403
+    assert client.post(path+"/preview", headers=headers, json=payload).status_code == 200
+    assert client.get(path, headers=headers).json()["revision"] == 1
+    payload["revision"] = 0
+    assert client.post(path+"/preview", headers=headers, json=payload).status_code == 409

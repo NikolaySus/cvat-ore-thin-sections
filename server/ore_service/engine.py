@@ -6,9 +6,10 @@ from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from . import segmentation as seg
+from .sketch import compose, geometry, normalize_state
 
 COLORS = {"ore": (255, 35, 35), "matrix": (255, 235, 0), "talc": (0, 70, 255), "damage": (128, 0, 45)}
 Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "1000000000"))
@@ -18,17 +19,11 @@ def defaults() -> dict:
     return {"algorithm": "approach2", "corrected": False,
             "approach1": asdict(seg.Approach1Settings()), "approach2": asdict(seg.Approach2Settings()),
             "sketch": asdict(seg.SketchSettings()), "correction": asdict(seg.CorrectionSettings()),
-            "regionMode": "inside", "segments": [], "strokes": []}
+            "regionMode": "inside", "segments": [], "strokes": [], "deletedImportedComponents": []}
 
 
 def sketch_image(size: tuple[int, int], state: dict, path: Path | None) -> Image.Image:
-    image = Image.open(path).convert("RGB") if path and path.exists() else Image.new("RGB", size, "white")
-    draw = ImageDraw.Draw(image)
-    for stroke in state.get("strokes", []):
-        points = [tuple(point) for point in stroke]
-        if len(points) > 1:
-            draw.line(points, fill=(0, 55, 255), width=max(3, round(max(size) / 300)))
-    return image
+    return compose(size, normalize_state(state), path)[0]
 
 
 def encode_mask(mask: np.ndarray) -> list[int]:
@@ -79,14 +74,13 @@ def encode_resized_mask(mask: np.ndarray, size: tuple[int, int]) -> list[int]:
 
 
 def execute(input_path: str, sketch_path: str, state: dict, output_path: str, kind: str) -> None:
+    state = normalize_state(state)
     output = Path(output_path)
     output.mkdir(parents=True, exist_ok=True)
     with Image.open(input_path) as opened:
         image = opened.convert("RGB")
     if kind == "geometry":
-        sketch = sketch_image(image.size, state, Path(sketch_path))
-        result = seg.build_sketch_geometry(image, sketch, seg.SketchSettings(**state["sketch"]),
-                                           state["segments"], state["regionMode"])
+        result = geometry(image.size, state, Path(sketch_path))
         (output / "result.json").write_text(json.dumps(result), encoding="utf-8")
         return
     settings_type = seg.Approach1Settings if state["algorithm"] == "approach1" else seg.Approach2Settings

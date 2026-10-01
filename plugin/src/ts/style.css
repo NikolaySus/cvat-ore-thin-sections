@@ -33,5 +33,8 @@
 .ore-legend span { display: inline-flex; align-items: center; gap: 5px; }
 .ore-legend i { width: 12px; height: 12px; border: 1px solid #0004; }
 .ore-progress { display: flex; align-items: center; justify-content: space-between; }
+.ore-geometry-status { color: #586269; padding: 6px 0; font-size: 12px; }
+.ore-connection-actions { display: flex; gap: 4px; width: 72px; height: 34px; }
+.ore-connection-actions button { width: 32px; height: 32px; padding: 4px; flex: none; color: #25282c; }
 @media (max-width: 800px) { .ore-backdrop { padding: 0; } .ore-layout { grid-template-columns: 235px minmax(0, 1fr); } .ore-panel header { gap: 10px; } .ore-field { grid-template-columns: minmax(0, 1fr) 75px; } }
 @media (max-width: 540px) { .ore-layout { display: flex; flex-direction: column; } .ore-layout aside { max-height: 30%; border-right: 0; border-bottom: 1px solid #d5d8dc; } .ore-layout main { flex: 1; } .ore-panel header { font-size: 12px; } .ore-panel header strong { font-size: 15px; } }
