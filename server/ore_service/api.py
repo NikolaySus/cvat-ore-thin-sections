@@ -5,6 +5,8 @@ import json
 import math
 import os
 import hashlib
+import shutil
+import uuid
 from dataclasses import fields
 from io import BytesIO
 
@@ -19,7 +21,7 @@ from . import store
 from .engine import defaults, COLORS
 from .queue import Work, WorkQueue
 from .settings import BOUNDS
-from .sketch import normalize_state, import_digest
+from .sketch import normalize_state, import_digest, geometry, compose
 from .preview import PreviewQueue
 
 app = FastAPI(title="Ore annotation CVAT service")
@@ -28,6 +30,11 @@ work_queue = WorkQueue()
 preview_queue = PreviewQueue()
 Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "1000000000"))
 download_locks: dict[tuple[int, int], asyncio.Lock] = {}
+edit_locks: dict[tuple[int, int], asyncio.Lock] = {}
+
+
+def edit_lock(job, frame):
+    return edit_locks.setdefault((job, frame), asyncio.Lock())
 
 
 def auth_headers(request):
@@ -80,6 +87,13 @@ class FrameState(BaseModel):
 class PreviewState(FrameState):
     session: str
     generation: int
+
+
+class TransitionState(BaseModel):
+    revision: int
+    action: str
+    note: str = ""
+    result_id: str | None = None
 
 
 def validate_state(state):
@@ -151,7 +165,79 @@ async def get_frame(request: Request, job: int, frame: int):
 @app.put("/ore/api/frames/{job}/{frame}")
 async def put_frame(request: Request, job: int, frame: int, payload: FrameState):
     await check_access(request, job, frame)
-    return store.save(job, frame, validate_state(payload.state), payload.revision)
+    async with edit_lock(job, frame):
+        return store.save(job, frame, validate_state(payload.state), payload.revision)
+
+
+@app.post("/ore/api/frames/{job}/{frame}/transition")
+async def transition_frame(request: Request, job: int, frame: int, payload: TransitionState):
+    path = await source(request, job, frame)
+    user = (await cvat_get(request, "/api/users/self")).json()
+    actor = {"id": user.get("id"), "username": user.get("username", "unknown")}
+    if len(payload.note) > 4000:
+        raise HTTPException(422, "Замечание слишком длинное.")
+    async with edit_lock(job, frame):
+        current = store.load(job, frame)
+        if current["revision"] != payload.revision:
+            raise HTTPException(409, "Кадр изменён в другой сессии. Откройте его заново.")
+        snapshot = None
+        folder = None
+        try:
+            if payload.action in ("handoff", "submit"):
+                required = "sketch" if payload.action == "handoff" else "refinement"
+                if current["workflow"]["stage"] != required:
+                    raise HTTPException(409, "Этот переход недоступен на текущем этапе.")
+                with Image.open(path) as image:
+                    size = image.size
+                state = current["state"]
+                sketch = path.parent / "sketch.png"
+                snapshot = {"id": uuid.uuid4().hex, "revision": payload.revision, "state": state, "actor": actor}
+                if payload.action == "submit":
+                    if not payload.result_id:
+                        raise HTTPException(422, "Сначала рассчитайте маски.")
+                    item = work_queue.get(payload.result_id)
+                    if (item.job, item.frame, item.revision, item.kind, item.status) != (job, frame, payload.revision, "segmentation", "completed") or item.state != state:
+                        raise HTTPException(409, "Маски не соответствуют текущей версии.")
+                    if import_digest(item.sketch) != import_digest(sketch):
+                        raise HTTPException(409, "Эскиз изменился после расчёта.")
+                    contours = await asyncio.to_thread(geometry, size, state, sketch)
+                    if not contours["lines"] or any(not line["closed"] for line in contours["lines"]):
+                        raise HTTPException(422, "Замкните все контуры перед передачей на проверку.")
+                    snapshot.update({"geometry": contours, "result_id": item.id})
+                folder = path.parent / "snapshots" / snapshot["id"]
+                folder.mkdir(parents=True)
+                if payload.action == "handoff":
+                    if sketch.exists():
+                        shutil.copyfile(sketch, folder / "import.png")
+                    # Preserve the expert's raw raster and confirmed manual connections, not cleaned contours.
+                    def capture():
+                        raw = compose(size, state, sketch)[0]
+                        from . import segmentation as segmentation
+                        from PIL import ImageDraw
+                        drawer = ImageDraw.Draw(raw)
+                        for segment in state["segments"]:
+                            points = (segmentation._perimeter_route_points(segment["a"], segment["b"], *size)
+                                      if segment.get("uiRoute") == "perimeter" else
+                                      segmentation._cubic_curve_points(segment["a"], segment["control"], segment["tangent"], segment["b"], *size))
+                            drawer.line([tuple(p) for p in points], fill=(0, 55, 255), width=max(3, round(max(size) / 300)))
+                        raw.thumbnail((2000, 2000))
+                        raw.save(folder / "expert.png")
+                    await asyncio.to_thread(capture)
+                (folder / "snapshot.json").write_text(json.dumps(snapshot), encoding="utf-8")
+            return store.transition(job, frame, payload.revision, payload.action, actor, payload.note, snapshot)
+        except Exception:
+            if folder:
+                shutil.rmtree(folder, ignore_errors=True)
+            raise
+
+
+@app.get("/ore/api/frames/{job}/{frame}/expert.png")
+async def expert_asset(request: Request, job: int, frame: int):
+    await check_access(request, job, frame)
+    expert = store.load(job, frame)["workflow"]["expert"]
+    if not expert:
+        raise HTTPException(404, "Исходные наметки отсутствуют.")
+    return FileResponse(store.frame_dir(job, frame) / "snapshots" / expert["id"] / "expert.png", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/ore/api/frames/{job}/{frame}/image")
@@ -191,13 +277,14 @@ async def upload_sketch(request: Request, job: int, frame: int, revision: int, f
         raise
     except Exception:
         raise HTTPException(422, "Не удалось прочитать эскиз.")
-    current = store.load(job, frame)
-    current["state"]["segments"] = []
-    current["state"]["strokes"] = []
-    current["state"]["deletedImportedComponents"] = []
-    saved = store.save(job, frame, current["state"], revision)
-    sketch.save(path.parent / "sketch.png")
-    return {**saved, "importDigest": import_digest(path.parent / "sketch.png")}
+    async with edit_lock(job, frame):
+        current = store.load(job, frame)
+        current["state"]["segments"] = []
+        current["state"]["strokes"] = []
+        current["state"]["deletedImportedComponents"] = []
+        saved = store.save(job, frame, current["state"], revision)
+        sketch.save(path.parent / "sketch.png")
+        return {**saved, "importDigest": import_digest(path.parent / "sketch.png")}
 
 
 @app.post("/ore/api/frames/{job}/{frame}/jobs")
@@ -205,23 +292,30 @@ async def start_job(request: Request, job: int, frame: int, revision: int, kind:
     if kind not in ("segmentation", "geometry"):
         raise HTTPException(422, "Неизвестный тип расчёта.")
     path = await source(request, job, frame)
-    current = store.load(job, frame)
-    if current["revision"] != revision:
-        raise HTTPException(409, "Настройки изменились. Откройте кадр заново.")
-    item = Work(job, frame, revision, kind, str(path), str(path.parent / "sketch.png"), current["state"])
-    return work_queue.describe(work_queue.submit(item))
+    async with edit_lock(job, frame):
+        current = store.load(job, frame)
+        if current["revision"] != revision:
+            raise HTTPException(409, "Настройки изменились. Откройте кадр заново.")
+        item = Work(job, frame, revision, kind, str(path), "", current["state"])
+        item.output.mkdir(parents=True)
+        frozen = item.output / "sketch.png"
+        if (path.parent / "sketch.png").exists():
+            shutil.copyfile(path.parent / "sketch.png", frozen)
+        item.sketch = str(frozen)
+        return work_queue.describe(work_queue.submit(item))
 
 
 @app.delete("/ore/api/frames/{job}/{frame}/sketch")
 async def clear_sketch(request: Request, job: int, frame: int, revision: int):
     await check_access(request, job, frame)
-    current = store.load(job, frame)
-    current["state"]["segments"] = []
-    current["state"]["strokes"] = []
-    current["state"]["deletedImportedComponents"] = []
-    saved = store.save(job, frame, current["state"], revision)
-    (store.frame_dir(job, frame) / "sketch.png").unlink(missing_ok=True)
-    return saved
+    async with edit_lock(job, frame):
+        current = store.load(job, frame)
+        current["state"]["segments"] = []
+        current["state"]["strokes"] = []
+        current["state"]["deletedImportedComponents"] = []
+        saved = store.save(job, frame, current["state"], revision)
+        (store.frame_dir(job, frame) / "sketch.png").unlink(missing_ok=True)
+        return saved
 
 
 @app.post("/ore/api/frames/{job}/{frame}/preview")

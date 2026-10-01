@@ -36,5 +36,23 @@
 .ore-geometry-status { color: #586269; padding: 6px 0; font-size: 12px; }
 .ore-connection-actions { display: flex; gap: 4px; width: 72px; height: 34px; }
 .ore-connection-actions button { width: 32px; height: 32px; padding: 4px; flex: none; color: #25282c; }
+.ore-stage { font-size: 16px; margin: 0 0 12px; }
+.ore-author { color: #586269; font-size: 12px; margin: 10px 0; overflow-wrap: anywhere; }
+.ore-review-note { border-left: 3px solid #d79320; padding: 8px; background: #fff4d9; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ore-field:has(textarea) { grid-template-columns: 1fr; }
+.ore-field textarea { box-sizing: border-box; width: 100%; min-height: 90px; resize: vertical; border: 1px solid #bfc5cb; border-radius: 3px; padding: 6px; }
+.ore-review-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ore-review-controls select { max-width: 100%; padding: 7px; border: 1px solid #bfc5cb; background: white; border-radius: 3px; }
+.ore-review-layout { grid-template-columns: 250px minmax(0, 1fr); }
+.ore-review-layers > g { opacity: 0; }
+.ore-phase-auto .ore-review-expert { animation: ore-expert-cycle 3.9s linear infinite; }
+.ore-phase-auto .ore-review-contours { animation: ore-contours-cycle 3.9s linear infinite; }
+.ore-phase-auto .ore-review-mask { animation: ore-mask-cycle 3.9s linear infinite; }
+.ore-paused > g { animation-play-state: paused !important; }
+.ore-phase-expert .ore-review-expert, .ore-phase-contours .ore-review-contours, .ore-phase-masks .ore-review-contours { opacity: 1; }
+.ore-phase-masks .ore-review-mask { opacity: .55; }
+@keyframes ore-expert-cycle { 0%, 25.64% { opacity: 1; } 33.33%, 92.31% { opacity: 0; } 100% { opacity: 1; } }
+@keyframes ore-contours-cycle { 0%, 25.64% { opacity: 0; } 33.33%, 92.31% { opacity: 1; } 100% { opacity: 0; } }
+@keyframes ore-mask-cycle { 0%, 58.97% { opacity: 0; } 66.67%, 92.31% { opacity: .55; } 100% { opacity: 0; } }
 @media (max-width: 800px) { .ore-backdrop { padding: 0; } .ore-layout { grid-template-columns: 235px minmax(0, 1fr); } .ore-panel header { gap: 10px; } .ore-field { grid-template-columns: minmax(0, 1fr) 75px; } }
 @media (max-width: 540px) { .ore-layout { display: flex; flex-direction: column; } .ore-layout aside { max-height: 30%; border-right: 0; border-bottom: 1px solid #d5d8dc; } .ore-layout main { flex: 1; } .ore-panel header { font-size: 12px; } .ore-panel header strong { font-size: 15px; } }

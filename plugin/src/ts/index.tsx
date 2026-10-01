@@ -11,6 +11,7 @@ import './style.css';
 
 type Point = [number, number];
 const API = '/ore/api';
+const stages: Record<string, string> = { sketch: 'Наметки', refinement: 'Доработка', review: 'На проверке', accepted: 'Принято' };
 const classes = [
     { key: 'matrix', title: 'Матрица', color: '#ffeb00' },
     { key: 'ore', title: 'Сульфидные фазы', color: '#ff2323' },
@@ -73,10 +74,22 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
     const recordRef = useRef<any>(null);
     recordRef.current = record;
     const [settings, setSettings] = useState<any>(null);
+    const stage = record?.workflow?.stage || 'sketch';
+    const reviewing = stage === 'review' || stage === 'accepted';
+    const [reviewPhase, setReviewPhase] = useState('auto');
+    const [reviewPaused, setReviewPaused] = useState(false);
+    const [hiddenPage, setHiddenPage] = useState(document.hidden);
+    const [reducedMotion, setReducedMotion] = useState(window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    const [remark, setRemark] = useState('');
+    const [declining, setDeclining] = useState(false);
+    const [showExpert, setShowExpert] = useState(false);
+    const [loadedAssets, setLoadedAssets] = useState<string[]>([]);
     const [geometry, setGeometry] = useState<any>(null);
     const pendingStrokes = settings?.strokes.filter((stroke: any) => !geometry?.processedStrokeIds?.includes(stroke.id)) || [];
     const geometryPending = Boolean(settings && (!geometry || geometry.sourceKey !== geometryKey(settings)));
     const [result, setResult] = useState<any>(null);
+    const reviewReady = loadedAssets.includes('original') && loadedAssets.includes(result?.id) &&
+        (!record?.workflow?.expert || loadedAssets.includes(record.workflow.expert.id));
     const [work, setWork] = useState<any>(null);
     const [error, setError] = useState('');
     const [notice, setNotice] = useState('');
@@ -121,6 +134,8 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
             setRecord(data);
             setSettings(data.state);
             setBox([0, 0, data.width, data.height]);
+            recordRef.current = data;
+            if (['review', 'accepted'].includes(data.workflow.stage)) loadReview(data).catch((exc) => setError(exc.message));
             const next: Record<string, number> = {};
             for (const item of classes) {
                 const label = job.labels.find((candidate: any) => candidate.name === item.title || candidate.name === item.key);
@@ -140,6 +155,43 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
         };
     }, []);
 
+    useEffect(() => {
+        const media = window.matchMedia('(prefers-reduced-motion: reduce)');
+        const motion = () => setReducedMotion(media.matches);
+        const visibility = () => setHiddenPage(document.hidden);
+        media.addEventListener('change', motion);
+        document.addEventListener('visibilitychange', visibility);
+        return () => { media.removeEventListener('change', motion); document.removeEventListener('visibilitychange', visibility); };
+    }, []);
+
+    async function loadReview(data: any): Promise<void> {
+        const snapshot = data.workflow.review;
+        if (!snapshot) return;
+        setReviewPhase('auto'); setReviewPaused(false);
+        setGeometry({ ...snapshot.geometry, sourceKey: geometryKey(data.state) });
+        const output = await request(`/jobs/${snapshot.result_id}/result`);
+        if (mounted.current) setResult({ ...output, id: snapshot.result_id });
+        setView('review'); setMode('pan'); setSelectedSegment(null); setConnectionDraft(null);
+    }
+
+    async function transition(action: string, edit = false): Promise<void> {
+        if (connectionDraft) { setError('Подтвердите или отмените черновик соединения.'); return; }
+        setBusy(true); setError('');
+        try {
+            const saved = reviewing ? recordRef.current : await save();
+            const data = await request(`${base}/transition`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ revision: saved.revision, action, note: remark, result_id: result?.id }) });
+            recordRef.current = { ...recordRef.current, ...data };
+            setRecord(recordRef.current); setSettings(data.state);
+            history.current = []; setSelection(null); setSelectedSegment(null); setConnectionDraft(null);
+            setDeclining(false);
+            if (['review', 'accepted'].includes(data.workflow.stage)) await loadReview(data);
+            else { setView('sketch'); setMode(edit ? 'draw' : 'pan'); setResult(null); setGeometry(null); }
+            setNotice('');
+        } catch (exc) { setError(exc.message); }
+        finally { setBusy(false); }
+    }
+
     const requestedGeometryKey = settings && geometryKey(settings);
     useEffect(() => {
         if (!settings || !svgRef.current) return undefined;
@@ -148,10 +200,10 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
         return () => observer.disconnect();
     }, [Boolean(settings)]);
     useEffect(() => {
-        if (!settings || !autoGeometry || busy || pointerActive) return undefined;
+        if (!settings || !autoGeometry || busy || pointerActive || reviewing) return undefined;
         const timer = setTimeout(() => { refreshGeometry(); }, 700);
         return () => clearTimeout(timer);
-    }, [requestedGeometryKey, autoGeometry, busy, pointerActive]);
+    }, [requestedGeometryKey, autoGeometry, busy, pointerActive, reviewing]);
 
     async function refreshGeometry(): Promise<boolean> {
         while (saveFlight.current) await saveFlight.current;
@@ -201,6 +253,7 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
     }
 
     function change(next: any): void {
+        if (reviewing) return;
         history.current.push(structuredClone(settings));
         history.current = history.current.slice(-30);
         setSettings(next);
@@ -391,7 +444,9 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
         setError('');
         try {
             const current = await request(base);
-            if (current.revision !== result.revision) throw new Error('Результат устарел. Выполните расчёт заново.');
+            if (current.workflow.stage !== 'accepted' || current.revision !== recordRef.current.revision || current.workflow.review?.result_id !== result.id) {
+                throw new Error('Сначала примите актуальную версию результата.');
+            }
             if (classes.some((item) => !mapping[item.key])) throw new Error('Сопоставьте все четыре класса с метками задания.');
             if (new Set(Object.values(mapping)).size !== 4) throw new Error('Для каждого класса нужна отдельная метка.');
             const existing = await job.annotations.get(frame, false, []);
@@ -531,8 +586,34 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
             {error && <div className='ore-error' role='alert'>{error}</div>}
             {notice && <div className='ore-notice' role='status'>{notice}</div>}
             {!settings ? <div className='ore-loading'>{error ? 'Не удалось открыть кадр' : 'Загрузка кадра…'}</div> :
-                <div className='ore-layout'>
+                <div className={`ore-layout ${reviewing ? 'ore-review-layout' : ''}`}>
                     <aside>
+                        <h3 className='ore-stage'>{stages[stage]}</h3>
+                        {record.workflow.note && <div className='ore-review-note'>{record.workflow.note}</div>}
+                        {record.workflow.events.length > 0 && <div className='ore-author'>
+                            {record.workflow.events[record.workflow.events.length - 1].actor.username}
+                            {' · '}{new Date(record.workflow.events[record.workflow.events.length - 1].time * 1000).toLocaleString('ru-RU')}
+                        </div>}
+                        {reviewing ? <>
+                            {stage === 'review' ? <>
+                                {!declining ? <>
+                                    <button className='ore-primary' disabled={busy || !result || !reviewReady} onClick={() => transition('accept')}><CheckOutlined /> Принять</button>
+                                    <button disabled={busy || !reviewReady} onClick={() => { setDeclining(true); setReviewPaused(true); }}><CloseOutlined /> Отклонить</button>
+                                </> : <>
+                                <label className='ore-field'><span>Замечание</span><textarea aria-label='Замечание' value={remark} maxLength={4000} onChange={(event) => setRemark(event.target.value)} /></label>
+                                <div className='ore-actions'>
+                                    <button disabled={busy || !remark.trim()} onClick={() => transition('reject')}><CloseOutlined /> Вернуть на доработку</button>
+                                    <button disabled={busy || !remark.trim()} onClick={() => transition('reject', true)}><EditOutlined /> Исправить самому</button>
+                                    <button disabled={busy} onClick={() => { setDeclining(false); setReviewPaused(false); }}>Отмена</button>
+                                </div>
+                                </>}
+                            </> : <button disabled={busy} onClick={() => transition('reopen', true)}><EditOutlined /> Вернуть в доработку</button>}
+                        </> : <>
+                        {stage === 'sketch' && <div className='ore-actions'>
+                            <button disabled={busy} onClick={() => upload.current.click()}><UploadOutlined /> Импорт эскиза</button>
+                            <button className='ore-primary' disabled={busy || Boolean(connectionDraft)} onClick={() => transition('handoff')}>Передать на доработку</button>
+                        </div>}
+                        <details className='ore-calculation-settings' open={stage === 'refinement'}><summary>Настройки расчёта</summary>
                         <label className='ore-field'><span>Алгоритм</span><select value={settings.algorithm} disabled={busy}
                             onChange={(e) => change({ ...settings, algorithm: e.target.value })}>
                             <option value='approach2'>Цветовая доразметка</option><option value='approach1'>Базовая кластеризация</option>
@@ -559,27 +640,43 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
                             onChange={(e) => change({ ...settings, regionMode: e.target.value })}>
                             <option value='inside'>Внутри контура</option><option value='outside'>Снаружи контура</option></select></label>
                         <details><summary>Настройки коррекции</summary>{Object.keys(settings.correction).map((key) => field('correction', key))}</details>
+                        </details>
                         <label className='ore-check'><input type='checkbox' checked={autoGeometry} disabled={busy}
                             onChange={(event) => setAutoGeometry(event.target.checked)} /> Автообновление контуров</label>
                         {!autoGeometry && <div className='ore-actions'><button disabled={busy || geometryRefreshing}
                             onClick={() => calculate('geometry')}><LinkOutlined /> Обновить контуры</button></div>}
                         {geometryRefreshing && <div className='ore-geometry-status' role='status'>Обновление контуров…</div>}
-                        <button className='ore-primary' disabled={busy} onClick={() => calculate('segmentation')}><PlayCircleOutlined /> Рассчитать маски</button>
+                        {stage === 'refinement' && <>
+                            <button className='ore-primary' disabled={busy || Boolean(connectionDraft)} onClick={() => calculate('segmentation')}><PlayCircleOutlined /> Рассчитать маски</button>
+                            <button disabled={busy || !result || geometryPending || !geometry?.lines?.length || geometry.lines.some((line: any) => !line.closed) || Boolean(connectionDraft)}
+                                onClick={() => transition('submit')}>Передать на проверку</button>
+                            {geometry && geometry.lines.some((line: any) => !line.closed) && <div className='ore-geometry-status'>Есть незамкнутые контуры</div>}
+                        </>}
                         {busy && <div className='ore-progress' role='status'>{work?.status === 'queued' ? `Очередь: ${work.position}` : 'Расчёт…'} {work?.elapsed || 0} с
                             <button title='Отменить расчёт' onClick={() => activeWork.current && request(`/jobs/${activeWork.current}`, { method: 'DELETE' }).catch((exc) => setError(exc.message))}><StopOutlined /></button></div>}
+                        </>}
                         <details><summary>Метки CVAT</summary>{classes.map((item) => <label className='ore-field' key={item.key}><span>{item.title}</span>
                             <select value={mapping[item.key] || ''} onChange={(e) => setMapping({ ...mapping, [item.key]: Number(e.target.value) })}>
                                 <option value=''>Выберите метку</option>{job.labels.map((label: any) => <option key={label.id} value={label.id}>{label.name}</option>)}</select></label>)}</details>
-                        <div className='ore-actions'><button title='Экспорт настроек JSON' onClick={() => download(`settings-${job.id}-${frame}.json`, JSON.stringify(settings, null, 2))}><DownloadOutlined /></button>
+                        {!reviewing && <div className='ore-actions'><button title='Экспорт настроек JSON' onClick={() => download(`settings-${job.id}-${frame}.json`, JSON.stringify(settings, null, 2))}><DownloadOutlined /></button>
                             <button title='Импорт настроек JSON' disabled={busy} onClick={() => importSettings.current.click()}><UploadOutlined /></button>
-                            <button title='Сохранить настройки' disabled={busy} onClick={() => save().then(() => setNotice('Настройки сохранены.')).catch((exc) => setError(exc.message))}>Сохранить</button></div>
+                            <button title='Сохранить настройки' disabled={busy} onClick={() => save().then(() => setNotice('Настройки сохранены.')).catch((exc) => setError(exc.message))}>Сохранить черновик</button></div>}
                     </aside>
                     <main>
                         <div className='ore-toolbar'>
-                            <div className='ore-segmented'><button className={view === 'sketch' ? 'active' : ''} onClick={() => setView('sketch')}><EditOutlined /> Эскиз</button>
-                                <button className={view === 'result' ? 'active' : ''} disabled={!result} onClick={() => setView('result')}><EyeOutlined /> Результат</button></div>
+                            {!reviewing && <div className='ore-segmented'><button className={view === 'sketch' ? 'active' : ''} onClick={() => setView('sketch')}><EditOutlined /> Эскиз</button>
+                                <button className={view === 'result' ? 'active' : ''} disabled={!result} onClick={() => setView('result')}><EyeOutlined /> Результат</button></div>}
+                            {reviewing && <div className='ore-review-controls'>
+                                <button title={reviewPaused ? 'Продолжить цикл' : 'Приостановить цикл'} disabled={reviewPhase !== 'auto' || reducedMotion}
+                                    onClick={() => setReviewPaused(!reviewPaused)}>{reviewPaused ? <PlayCircleOutlined /> : <StopOutlined />}</button>
+                                <select aria-label='Слой проверки' value={reviewPhase} onChange={(event) => setReviewPhase(event.target.value)}>
+                                    <option value='auto'>Автоматический обзор</option><option value='expert'>Оригинал и наметки</option>
+                                    <option value='contours'>Чистовые контуры</option><option value='masks'>Маски и контуры</option>
+                                </select>
+                            </div>}
                             <div className='ore-tools'>
                                 <button title='Перемещение' className={mode === 'pan' ? 'active' : ''} onClick={() => setMode('pan')}><DragOutlined /></button>
+                                {!reviewing && <>
                                 <button title='Рисовать контур' className={mode === 'draw' ? 'active' : ''} onClick={() => setMode('draw')}><EditOutlined /></button>
                                 <button title={geometryPending ? 'Контуры ещё не обновлены' : 'Удалить контур'} disabled={busy || geometryPending}
                                     className={mode === 'erase' ? 'active' : ''} onClick={() => setMode('erase')}><ClearOutlined /></button>
@@ -592,6 +689,7 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
                                     if (settings.segments.some((item: any) => item.id === selected.id)) change({ ...settings, segments: settings.segments.filter((item: any) => item.id !== selected.id) });
                                     setSelectedSegment(null); setConnectionDraft(null);
                                 }}><DeleteOutlined /></button>
+                                </>}
                                 <button title='Увеличить' onClick={() => zoom(.8)}><ZoomInOutlined /></button>
                                 <button title='Уменьшить' onClick={() => zoom(1.25)}><ZoomOutOutlined /></button>
                                 <button title='Вписать изображение' onClick={() => setBox([0, 0, record.width, record.height])}><AimOutlined /></button>
@@ -604,13 +702,29 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
                             {view === 'result' && <label>Наложение <input aria-label='Прозрачность маски' type='range' min='0' max='1' step='.05' value={opacity} onChange={(e) => setOpacity(Number(e.target.value))} /></label>}
                             {view === 'result' && <label><input type='checkbox' checked={showSketch} disabled={busy}
                                 onChange={(event) => toggleSketch(event.target.checked)} /> Показать эскиз</label>}
+                            {!reviewing && record.workflow.expert && <label><input type='checkbox' checked={showExpert}
+                                onChange={(event) => setShowExpert(event.target.checked)} /> Исходные наметки</label>}
                         </div>
                         <div className='ore-canvas'>
                             <svg ref={svgRef} viewBox={box.join(' ')} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp}
                                 onPointerCancel={pointerUp} onWheel={(event) => zoom(event.deltaY > 0 ? 1.1 : .9)}>
-                                <image href={`${API}${base}/image`} width={record.width} height={record.height} />
+                                <image href={`${API}${base}/image`} width={record.width} height={record.height}
+                                    onLoad={() => setLoadedAssets((previous) => [...new Set([...previous, 'original'])])} onError={() => setError('Не удалось загрузить оригинал.')} />
+                                {reviewing && <g className={`ore-review-layers ore-phase-${reviewPhase === 'auto' && reducedMotion ? 'masks' : reviewPhase} ${reviewPaused || hiddenPage || !reviewReady ? 'ore-paused' : ''}`} pointerEvents='none'>
+                                    <g className='ore-review-mask'>{result && <image href={`${API}/jobs/${result.id}/mask.png`} width={record.width} height={record.height}
+                                        onLoad={() => setLoadedAssets((previous) => [...new Set([...previous, result.id])])} onError={() => setError('Не удалось загрузить маски.')} />}</g>
+                                    <g className='ore-review-expert'>{record.workflow.expert && <image href={`${API}${base}/expert.png?version=${record.workflow.expert.id}`}
+                                        width={record.width} height={record.height} style={{ mixBlendMode: 'multiply' }}
+                                        onLoad={() => setLoadedAssets((previous) => [...new Set([...previous, record.workflow.expert.id])])} onError={() => setError('Не удалось загрузить исходные наметки.')} />}</g>
+                                    <g className='ore-review-contours' fill='none' stroke='#00e8b1' strokeWidth={Math.max(2, box[2] / 600)}>
+                                        {(record.workflow.review?.geometry.lines || []).map((line: any) => line.paths.map((path: string, index: number) => <path key={`${line.id}-${index}`} d={path} />))}
+                                        {(record.workflow.review?.geometry.segments || []).map((segment: any) => <polyline key={segment.id} points={segment.points.map((p: Point) => p.join(',')).join(' ')} />)}
+                                    </g>
+                                </g>}
+                                {!reviewing && showExpert && <image href={`${API}${base}/expert.png?version=${record.workflow.expert.id}`} width={record.width} height={record.height}
+                                    style={{ mixBlendMode: 'multiply' }} pointerEvents='none' />}
                                 {view === 'result' && result && <image href={`${API}/jobs/${result.id}/mask.png`} width={record.width} height={record.height} opacity={opacity} />}
-                                {(view === 'sketch' || (view === 'result' && showSketch)) && <g fill='none'
+                                {!reviewing && (view === 'sketch' || (view === 'result' && showSketch)) && <g fill='none'
                                     pointerEvents={view === 'result' ? 'none' : undefined} strokeWidth={Math.max(3, box[2] / 450)}>
                                     {view === 'sketch' && !geometry && record.hasSketch && !settings.deletedImportedComponents.length && <image href={`${API}${base}/sketch?revision=${record.revision}`}
                                         width={record.width} height={record.height} style={{ mixBlendMode: 'multiply' }} pointerEvents='none' />}
@@ -665,8 +779,8 @@ function Panel({ context, close }: { context: any; close: () => void }): JSX.Ele
                         </div>
                         <footer><div className='ore-legend'>{classes.map((item) => <span key={item.key}><i style={{ background: item.color }} />{item.title}
                             {result ? ` ${result.result.stats[item.key]}%` : ''}</span>)}</div>
-                            <div className='ore-actions'><button disabled={!result || busy || applying || applied.includes(result?.id)} onClick={() => apply(false)}>Добавить маски</button>
-                                <button disabled={!result || busy || applying || applied.includes(result?.id)} onClick={() => apply(true)}>Заменить предыдущие</button></div></footer>
+                            <div className='ore-actions'><button disabled={stage !== 'accepted' || !result || busy || applying || applied.includes(result?.id)} onClick={() => apply(false)}>Добавить маски</button>
+                                <button disabled={stage !== 'accepted' || !result || busy || applying || applied.includes(result?.id)} onClick={() => apply(true)}>Заменить предыдущие</button></div></footer>
                     </main>
                 </div>}
             <input ref={upload} type='file' accept='image/png,image/jpeg,image/tiff,.tif,.tiff' hidden onChange={uploadSketch} />
