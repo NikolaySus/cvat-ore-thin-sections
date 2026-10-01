@@ -1,0 +1,11 @@
+vendor/
+components/
+data/
+.venv/
+__pycache__/
+.pytest_cache/
+output/
+.playwright-cli/
+.env
+node_modules/
+*.egg-info/

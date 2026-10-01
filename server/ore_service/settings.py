@@ -1,0 +1,16 @@
+BOUNDS = {
+    "k": (3, 12), "ore_l_min": (0, 100), "ore_b_min": (-30, 60), "talc_l_max": (0, 80),
+    "matrix_subclusters": (2, 5), "ore_boundary_shift": (-1, 1), "talc_dark_quantile": (.05, .8),
+    "min_component_area": (0, 5000), "morph_radius": (0, 8), "max_work_side": (128, 4096),
+    "sample_pixels": (1000, 300000), "edge_refinement_strength": (0, 1), "edge_gradient_radius": (1, 8),
+    "edge_seed_erosion_radius": (0, 8), "edge_transition_radius": (0, 12), "edge_soft_delta_e": (1, 40),
+    "edge_min_region_area": (0, 5000), "illumination_correction_strength": (0, 1),
+    "illumination_ore_erosion_radius": (0, 12), "illumination_min_ore_area": (0, 100000),
+    "illumination_outlier_quantile": (0, .35), "illumination_max_delta_l": (0, 50),
+    "local_shadow_correction_strength": (0, 1), "local_shadow_radius": (3, 120),
+    "local_shadow_max_delta_l": (0, 40), "local_shadow_chroma_barrier": (0, 3), "local_shadow_lightness_barrier": (0, 2),
+    "endpoint_min_branch_length": (0, 200), "connection_max_distance": (0, 3000),
+    "connection_neighbors_per_endpoint": (1, 12), "angular_neighbors_per_endpoint": (0, 4),
+    "crop_excluded_talc_max_fraction": (0, 1), "crop_min_area_ratio": (.1, 1),
+    "crop_max_rotation_degrees": (0, 180), "crop_sketch_erosion_radius": (0, 5000),
+}
